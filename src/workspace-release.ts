@@ -1,10 +1,12 @@
 import { basename, dirname, posix } from "node:path";
+import { valid as validSemVer } from "semver";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { buildReleasePlan } from "./release.js";
 import { type PackageDescriptor } from "./packages.js";
 import { highestBump } from "./semver.js";
 import { targetFromDescriptor, updateTargetVersion } from "./version-adapters.js";
-import type { BumpLevel, PackageReleaseExplanation, PackageReleaseReason, ReadinessReport, ReleaseChange, ReleaseOutput, SemVergeConfig, WorkspaceDependencyField } from "./types.js";
+import { updateVersionFile } from "./version-updaters.js";
+import type { BumpLevel, CommunicationQualityReport, PackageReleaseExplanation, PackageReleaseReason, ReadinessReport, ReleaseChange, ReleaseOutput, SemVergeConfig, WorkspaceDependencyField } from "./types.js";
 import type { VersionFileChange } from "./version-files.js";
 
 export interface PackageRelease {
@@ -28,6 +30,7 @@ export interface WorkspaceReleasePlan {
   versionChanges: VersionFileChange[];
   unchangedPackages: PackageDescriptor[];
   manifest: string;
+  communicationQuality?: CommunicationQualityReport[];
 }
 
 export interface BuildWorkspaceReleasePlanInput {
@@ -188,14 +191,26 @@ function objectValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function updateDependencyRange(range: string, version: string): string {
-  const protocol = range.startsWith("workspace:") ? "workspace:" : "";
-  const value = protocol ? range.slice(protocol.length) : range;
-  if (value === "*" || value === "^" || value === "~") {
+function dependencyRangeError(range: string, version: string, context?: string): Error {
+  const location = context ? ` for ${context}` : "";
+  return new Error(`Cannot safely update internal dependency range "${range}"${location} to ${version}; only exact, ^, ~, workspace:^, workspace:~, and wildcard workspace ranges are supported. Update the range manually or use a supported form.`);
+}
+
+function updateDependencyRange(range: string, version: string, context?: string): string {
+  const leadingWhitespace = range.match(/^\s*/)?.[0] ?? "";
+  const trailingWhitespace = range.match(/\s*$/)?.[0] ?? "";
+  const trimmedRange = range.slice(leadingWhitespace.length, range.length - trailingWhitespace.length);
+  const protocol = trimmedRange.startsWith("workspace:") ? "workspace:" : "";
+  const value = protocol ? trimmedRange.slice(protocol.length) : trimmedRange;
+  if (value === "*" || value === "^" || value === "~" || value.startsWith("link:") || value.startsWith("file:")) {
     return range;
   }
-  const updated = value.replace(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?/, version);
-  return protocol ? `${protocol}${updated}` : updated;
+  const match = /^(\^|~)?([^\s]+)$/.exec(value);
+  const currentVersion = match?.[2];
+  if (!match || !currentVersion || !validSemVer(currentVersion) || !validSemVer(version)) {
+    throw dependencyRangeError(range, version, context);
+  }
+  return `${leadingWhitespace}${protocol}${match[1] ?? ""}${version}${trailingWhitespace}`;
 }
 
 function updateInternalDependencyRanges(files: Record<string, string>, packages: PackageDescriptor[], versions: Map<string, string>): VersionFileChange[] {
@@ -229,7 +244,7 @@ function updateInternalDependencyRanges(files: Record<string, string>, packages:
         if (!version || typeof range !== "string") {
           continue;
         }
-        const updated = updateDependencyRange(range, version);
+        const updated = updateDependencyRange(range, version, `${name} in ${packageItem.manifestPath}`);
         if (updated !== range) {
           dependencies[name] = updated;
           changed = true;
@@ -267,7 +282,7 @@ function updatePnpmLock(content: string, packages: PackageDescriptor[], versions
     if (packageItem) {
       const version = versions.get(packageItem.manifestPath);
       if (version && typeof importer.version === "string") {
-        const updated = updateDependencyRange(importer.version, version);
+        const updated = updateDependencyRange(importer.version, version, `${directory} importer version in pnpm-lock.yaml`);
         if (updated !== importer.version) {
           importer.version = updated;
           changed = true;
@@ -286,7 +301,7 @@ function updatePnpmLock(content: string, packages: PackageDescriptor[], versions
           continue;
         }
         if (typeof value === "string") {
-          const updated = updateDependencyRange(value, version);
+          const updated = updateDependencyRange(value, version, `${name} in pnpm-lock.yaml`);
           if (updated !== value) {
             dependencies[name] = updated;
             changed = true;
@@ -302,7 +317,7 @@ function updatePnpmLock(content: string, packages: PackageDescriptor[], versions
           if (typeof current !== "string") {
             continue;
           }
-          const updated = updateDependencyRange(current, version);
+          const updated = updateDependencyRange(current, version, `${name} in pnpm-lock.yaml`);
           if (updated !== current) {
             dependencyRecord[key] = updated;
             changed = true;
@@ -375,6 +390,50 @@ function updateNodeLocks(files: Record<string, string>, packages: PackageDescrip
   return changes;
 }
 
+function packageForVersionFile(spec: SemVergeConfig["versionFiles"][number], packages: PackageDescriptor[]): PackageDescriptor | undefined {
+  const requested = spec.package?.trim().toLowerCase();
+  if (!requested) {
+    return undefined;
+  }
+  return packages.find((packageItem) => [packageItem.id, packageItem.name, packageItem.directory, packageItem.manifestPath]
+    .some((value) => value.toLowerCase() === requested));
+}
+
+function updateConfiguredVersionFiles(
+  input: BuildWorkspaceReleasePlanInput,
+  packages: PackageDescriptor[],
+  versions: Map<string, string>,
+  hasRelease: boolean,
+  versionChanges: Map<string, VersionFileChange>
+): void {
+  if (!hasRelease) {
+    return;
+  }
+  const versionValues = [...new Set(versions.values())];
+  for (const spec of input.config.versionFiles) {
+    const packageItem = packageForVersionFile(spec, packages);
+    if (spec.package && !packageItem) {
+      throw new Error(`Configured version file ${spec.path} references unknown package ${spec.package}. Use a package id, name, directory, or manifest path.`);
+    }
+    if (input.mode === "independent" && !packageItem && versions.size > 1) {
+      throw new Error(`Configured version file ${spec.path} must set package for an independent release with multiple versions.`);
+    }
+    const version = packageItem ? versions.get(packageItem.manifestPath) : versionValues[0];
+    if (!version) {
+      if (packageItem) {
+        continue;
+      }
+      throw new Error(`No released package version is available for configured version file ${spec.path}.`);
+    }
+    const content = input.files[spec.path];
+    if (content === undefined) {
+      throw new Error(`Configured version file ${spec.path} was not found at the release commit.`);
+    }
+    const change = updateVersionFile(spec, content, version);
+    versionChanges.set(change.path, change);
+  }
+}
+
 function manifestContent(plan: WorkspaceReleasePlan): string {
   return `${JSON.stringify({
     schemaVersion: 2,
@@ -412,7 +471,8 @@ function manifestContent(plan: WorkspaceReleasePlan): string {
       private: packageItem.private,
       releaseable: packageItem.releaseable
     })),
-    readiness: plan.readiness
+    readiness: plan.readiness,
+    communicationQuality: plan.communicationQuality ?? []
   }, null, 2)}\n`;
 }
 
@@ -490,6 +550,7 @@ export function buildWorkspaceReleasePlan(input: BuildWorkspaceReleasePlanInput)
   const hasRelease = releasedPlans.length > 0;
   const releaseChanges = input.mode === "independent" ? [...new Map(packageReleases.flatMap((item) => item.plan.releaseChanges.map((change) => [change.title, change] as const))).values()] : input.changes.filter((change) => !change.skipped);
   const readiness = mergeReadiness(packageReleases.length > 0 ? packageReleases.map((item) => item.plan.readiness) : [input.readinessContext ? { passed: true, missingLabels: [], missingFiles: [], failedCommands: [], missingTasks: [], requestedTasks: [] } : { passed: true, missingLabels: [], missingFiles: [], failedCommands: [], missingTasks: [], requestedTasks: [] }]);
+  const communicationQuality = [...new Map(packageReleases.flatMap(({ plan }) => plan.communicationQuality ?? []).map((report) => [`${report.artifact}:${report.mode}:${JSON.stringify(report.findings)}`, report] as const)).values()];
   const version = input.mode === "independent" ? releasedPlans.map((item) => `${item.package.name}@${item.plan.version}`).join(", ") : plans[0]?.plan.version ?? input.packages[0]?.version ?? "0.0.0";
   const channel = input.mode === "independent"
     ? [...new Set(packageReleases.map((item) => item.plan.channel))].join(", ") || "stable"
@@ -532,6 +593,7 @@ export function buildWorkspaceReleasePlan(input: BuildWorkspaceReleasePlanInput)
   for (const change of updateNodeLocks(input.files, input.packages, versionMap)) {
     versionChangeMap.set(change.path, change);
   }
+  updateConfiguredVersionFiles(input, input.packages, versionMap, hasRelease, versionChangeMap);
   const versionChanges = [...versionChangeMap.values()];
 
   const outputMap = new Map<string, string>();
@@ -556,7 +618,8 @@ export function buildWorkspaceReleasePlan(input: BuildWorkspaceReleasePlanInput)
     outputs: [...outputMap].map(([path, content]) => ({ path, content })),
     versionChanges,
     unchangedPackages,
-    manifest: ""
+    manifest: "",
+    communicationQuality
   };
   const manifest = manifestContent(provisional);
   provisional.manifest = manifest;

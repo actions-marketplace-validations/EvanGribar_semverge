@@ -154,7 +154,7 @@ describe("package discovery and workspace releases", () => {
     expect(one?.explanation).toEqual({ reasons: ["direct-change"], directChanges: ["fix: repair shared export"], dependencies: [], dependencyTypes: {} });
     expect(two?.explanation).toEqual({ reasons: ["dependency-update"], directChanges: [], dependencies: ["@demo/one"], dependencyTypes: { "@demo/one": ["dependencies"] } });
     expect(two?.plan.releaseChanges.some((change) => change.dependencyUpdate)).toBe(true);
-    expect(two?.plan.customerNotes).toContain("No customer-facing changes");
+    expect(two?.plan.customerNotes).toContain("No customer-facing updates are included");
     expect(plan.manifest).toContain('"dependencyUpdate": true');
     expect(JSON.parse(plan.manifest).packages[1]).toMatchObject({ reasons: ["dependency-update"], dependencies: ["@demo/one"] });
     expect(plan.unchangedPackages.map((packageItem) => packageItem.name)).toEqual(["demo"]);
@@ -183,6 +183,87 @@ describe("package discovery and workspace releases", () => {
     expect(two?.plan.releaseChanges.some((change) => change.dependencyUpdate)).toBe(true);
     expect(plan.versionChanges.some((change) => change.path === "packages/two/package.json" && change.content.includes('"@demo/one": "^1.0.1"'))).toBe(true);
     expect(plan.versionChanges.some((change) => change.path === "pnpm-lock.yaml" && change.content.includes("version: 1.0.1"))).toBe(true);
+  });
+
+  it("updates supported exact, protocol, and wildcard workspace ranges consistently", () => {
+    const files = {
+      "package.json": JSON.stringify({ name: "demo", version: "1.0.0", private: true, workspaces: ["packages/*"] }),
+      "packages/one/package.json": JSON.stringify({ name: "@demo/one", version: "1.0.0" }),
+      "packages/two/package.json": JSON.stringify({
+        name: "@demo/two",
+        version: "1.0.0",
+        dependencies: { "@demo/one": "1.0.0" },
+        devDependencies: { "@demo/one": "workspace:~1.0.0" },
+        peerDependencies: { "@demo/one": "workspace:^1.0.0" },
+        optionalDependencies: { "@demo/one": "workspace:*" }
+      }),
+      "pnpm-lock.yaml": "lockfileVersion: '9.0'\nimporters:\n  .: {}\n  packages/one: {}\n  packages/two:\n    specifiers:\n      '@demo/one': 1.0.0\n    dependencies:\n      '@demo/one':\n        specifier: 1.0.0\n        version: 1.0.0\n    devDependencies:\n      '@demo/one':\n        specifier: 'workspace:~1.0.0'\n        version: 1.0.0\n    peerDependencies:\n      '@demo/one':\n        specifier: 'workspace:^1.0.0'\n        version: 1.0.0\n    optionalDependencies:\n      '@demo/one':\n        specifier: 'workspace:*'\n        version: 1.0.0\n"
+    };
+    const config = { ...DEFAULT_CONFIG, monorepo: { ...DEFAULT_CONFIG.monorepo, mode: "independent" as const } };
+    const discovered = discoverPackages(files, Object.keys(files), config);
+    const plan = buildWorkspaceReleasePlan({
+      packages: discovered.packages,
+      mode: "independent",
+      files,
+      config,
+      changes: [parseChange({ title: "fix: repair shared export", source: "pull_request", files: ["packages/one/src/index.ts"] })],
+      date: "2026-08-04"
+    });
+    const manifest = plan.versionChanges.find((change) => change.path === "packages/two/package.json")?.content ?? "";
+    const lockfile = plan.versionChanges.find((change) => change.path === "pnpm-lock.yaml")?.content ?? "";
+
+    expect(manifest).toContain('"@demo/one": "1.0.1"');
+    expect(manifest).toContain('"@demo/one": "workspace:~1.0.1"');
+    expect(manifest).toContain('"@demo/one": "workspace:^1.0.1"');
+    expect(manifest).toContain('"@demo/one": "workspace:*"');
+    expect(lockfile).toContain("specifier: 1.0.1");
+    expect(lockfile).toContain("workspace:~1.0.1");
+    expect(lockfile).toContain("workspace:^1.0.1");
+    expect(lockfile).toContain("workspace:*");
+    expect(lockfile).toContain("version: 1.0.1");
+  });
+
+  it.each([">=1.2.3 <2.0.0", "^1.2.3 || ^2.0.0", "1.2.3 - 1.9.9"])(
+    "rejects compound workspace dependency range %s instead of partially rewriting it",
+    (range) => {
+      const files = {
+        "package.json": JSON.stringify({ name: "demo", version: "1.0.0", private: true, workspaces: ["packages/*"] }),
+        "packages/one/package.json": JSON.stringify({ name: "@demo/one", version: "1.9.9" }),
+        "packages/two/package.json": JSON.stringify({ name: "@demo/two", version: "1.0.0", dependencies: { "@demo/one": range } })
+      };
+      const config = { ...DEFAULT_CONFIG, monorepo: { ...DEFAULT_CONFIG.monorepo, mode: "independent" as const } };
+      const discovered = discoverPackages(files, Object.keys(files), config);
+
+      expect(() => buildWorkspaceReleasePlan({
+        packages: discovered.packages,
+        mode: "independent",
+        files,
+        config,
+        changes: [parseChange({ title: "feat!: cross the upper dependency bound", source: "pull_request", breaking: true, files: ["packages/one/src/index.ts"] })],
+        date: "2026-08-04"
+      })).toThrow(new RegExp(`Cannot safely update internal dependency range .*${range.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*2\\.0\\.0`));
+    }
+  );
+
+  it("rejects compound ranges in pnpm lock metadata with the same fail-closed policy", () => {
+    const range = ">=1.9.9 <2.0.0";
+    const files = {
+      "package.json": JSON.stringify({ name: "demo", version: "1.0.0", private: true, workspaces: ["packages/*"] }),
+      "packages/one/package.json": JSON.stringify({ name: "@demo/one", version: "1.9.9" }),
+      "packages/two/package.json": JSON.stringify({ name: "@demo/two", version: "1.0.0", dependencies: { "@demo/one": "workspace:*" } }),
+      "pnpm-lock.yaml": "lockfileVersion: '9.0'\nimporters:\n  .: {}\n  packages/one: {}\n  packages/two:\n    dependencies:\n      '@demo/one':\n        specifier: '>=1.9.9 <2.0.0'\n        version: 1.9.9\n"
+    };
+    const config = { ...DEFAULT_CONFIG, monorepo: { ...DEFAULT_CONFIG.monorepo, mode: "independent" as const } };
+    const discovered = discoverPackages(files, Object.keys(files), config);
+
+    expect(() => buildWorkspaceReleasePlan({
+      packages: discovered.packages,
+      mode: "independent",
+      files,
+      config,
+      changes: [parseChange({ title: "feat!: cross the upper dependency bound", source: "pull_request", breaking: true, files: ["packages/one/src/index.ts"] })],
+      date: "2026-08-04"
+    })).toThrow(new RegExp(`Cannot safely update internal dependency range .*${range.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*2\\.0\\.0`));
   });
 
   it("applies independent dependency policies by manifest field", () => {
@@ -308,6 +389,12 @@ describe("ecosystem version adapters", () => {
     expect(readTargetName(target, content)).toBe("demo");
     expect(readTargetVersion(target, content)).toBe("1.2.3");
     expect(updateTargetVersion(target, content, "1.3.0").content).toContain('version = "1.3.0"');
+  });
+
+  it("reads Python __version__ values without backtracking across repeated newlines", () => {
+    const target = { ecosystem: "python" as const, manifestPath: "src/__init__.py", directory: "src" };
+    const content = `${"\n".repeat(20_000)}  __version__ = '1.2.3'\n`;
+    expect(readTargetVersion(target, content)).toBe("1.2.3");
   });
 
   it("reads and updates Rust Cargo versions", () => {

@@ -1,7 +1,6 @@
 import { parseSemVergeMetadata } from "./metadata.js";
-import type { BumpLevel, ChangeInput, ReleaseChannelPolicy, ReleaseChange, ReleaseKind } from "./types.js";
+import type { BumpLevel, ChangeInput, CustomerCommunication, CustomerImpact, ReleaseChannelPolicy, ReleaseChange, ReleaseKind } from "./types.js";
 
-const HEADER_PATTERN = /^(?<type>[a-z]+)(?:\((?<scope>[^)]+)\))?(?<breaking>!)?:\s*(?<description>.+)$/i;
 const LABEL_KIND: Record<string, ReleaseKind> = {
   "ship:feature": "feature",
   "ship:fix": "fix",
@@ -9,6 +8,24 @@ const LABEL_KIND: Record<string, ReleaseKind> = {
   "ship:internal": "internal",
   "ship:docs": "docs"
 };
+
+function isWhitespaceCharacter(value: string): boolean {
+  return value !== "" && value.trim() === "";
+}
+
+function isAsciiLetter(value: string): boolean {
+  const code = value.charCodeAt(0);
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function containsLineTerminator(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === "\r" || value[index] === "\n" || value[index] === "\u2028" || value[index] === "\u2029") {
+      return true;
+    }
+  }
+  return false;
+}
 
 export const PRERELEASE_CHANNEL_LABELS = {
   "ship:beta": "beta",
@@ -71,18 +88,65 @@ function hasBreakingFooter(body: string): boolean {
   return /(?:^|\n)BREAKING(?:-|\s)CHANGE\s*:/im.test(body);
 }
 
-function parseTitle(title: string): { kind: ReleaseKind; scope?: string; description: string; breaking: boolean } {
-  const match = HEADER_PATTERN.exec(title.trim());
-  if (!match?.groups) {
-    return { kind: "other", description: title.trim(), breaking: false };
+function customerImpact(kind: ReleaseKind, breaking: boolean): CustomerImpact {
+  if (breaking || kind === "breaking") {
+    return "changed";
   }
+  if (kind === "feature") {
+    return "new";
+  }
+  if (kind === "fix") {
+    return "fixed";
+  }
+  return "improved";
+}
+
+function parseTitle(title: string): { kind: ReleaseKind; scope?: string; description: string; breaking: boolean } {
+  const normalizedTitle = title.trim();
+  let cursor = 0;
+  while (cursor < normalizedTitle.length && isAsciiLetter(normalizedTitle[cursor] ?? "")) {
+    cursor += 1;
+  }
+  if (cursor === 0) {
+    return { kind: "other", description: normalizedTitle, breaking: false };
+  }
+
+  const type = normalizedTitle.slice(0, cursor);
+  let scope: string | undefined;
+  if (normalizedTitle[cursor] === "(") {
+    const scopeStart = cursor + 1;
+    const scopeEnd = normalizedTitle.indexOf(")", scopeStart);
+    if (scopeEnd <= scopeStart) {
+      return { kind: "other", description: normalizedTitle, breaking: false };
+    }
+    scope = normalizedTitle.slice(scopeStart, scopeEnd).trim();
+    cursor = scopeEnd + 1;
+  }
+
+  const breaking = normalizedTitle[cursor] === "!";
+  if (breaking) {
+    cursor += 1;
+  }
+  if (normalizedTitle[cursor] !== ":") {
+    return { kind: "other", description: normalizedTitle, breaking: false };
+  }
+  cursor += 1;
+  while (cursor < normalizedTitle.length && isWhitespaceCharacter(normalizedTitle[cursor] ?? "")) {
+    cursor += 1;
+  }
+
+  const description = normalizedTitle.slice(cursor);
+  if (!description || containsLineTerminator(description)) {
+    return { kind: "other", description: normalizedTitle, breaking: false };
+  }
+
   const result: { kind: ReleaseKind; scope?: string; description: string; breaking: boolean } = {
-    kind: kindFromConventionalType(match.groups.type ?? ""),
-    description: (match.groups.description ?? title).trim(),
-    breaking: Boolean(match.groups.breaking)
+    kind: kindFromConventionalType(type),
+    description,
+    breaking
   };
-  if (match.groups.scope) {
-    result.scope = match.groups.scope.trim();
+  if (scope !== undefined) {
+    result.scope = scope;
   }
   return result;
 }
@@ -124,7 +188,15 @@ export function parseChange(input: ChangeInput): ReleaseChange {
   const breaking = metadata.breaking ?? (labels.includes("ship:breaking") || parsed.breaking || hasBreakingFooter(body) || kind === "breaking");
   const skipped = metadata.skip === true || labels.includes("ship:skip");
   const description = parsed.description || input.title.trim();
-  const customerSummary = metadata.customer ?? description;
+  const customerCommunication: CustomerCommunication = {
+    ...(metadata.headline ? { headline: metadata.headline } : {}),
+    outcome: metadata.outcome ?? metadata.customer ?? description,
+    ...(metadata.detail ? { detail: metadata.detail } : {}),
+    impact: metadata.impact ?? customerImpact(kind, breaking),
+    ...(metadata.action ? { actionRequired: metadata.action } : {}),
+    ...(metadata.audience && metadata.audience.length > 0 ? { audience: [...metadata.audience] } : {})
+  };
+  const customerSummary = customerCommunication.outcome;
 
   const change: ReleaseChange = {
     title: input.title.trim(),
@@ -135,6 +207,7 @@ export function parseChange(input: ChangeInput): ReleaseChange {
     breaking,
     skipped,
     customerSummary,
+    customerCommunication,
     readiness: metadata.readiness ?? []
   };
   for (const [key, value] of Object.entries({
@@ -157,11 +230,12 @@ export function parseChange(input: ChangeInput): ReleaseChange {
 }
 
 export function formatChangeReference(change: ReleaseChange): string {
+  const customerText = change.customerCommunication?.headline ?? change.customerCommunication?.outcome ?? change.customerSummary;
   if (change.number !== undefined && change.url) {
-    return `[${change.customerSummary}](${change.url}) (#${change.number})`;
+    return `[${customerText}](${change.url}) (#${change.number})`;
   }
   if (change.number !== undefined) {
-    return `${change.customerSummary} (#${change.number})`;
+    return `${customerText} (#${change.number})`;
   }
-  return change.customerSummary;
+  return customerText;
 }

@@ -1,6 +1,6 @@
 {
   "name": "semverge",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "Release-readiness automation for Node.js and GitHub: versioning, customer communication, artifacts, npm publishing, and post-release verification.",
   "type": "module",
   "license": "MIT",
@@ -35,10 +35,10 @@
     "yaml": "^2.8.1"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2",
+    "@types/node": "^26.2.0",
     "@types/semver": "^7.8.0",
-    "esbuild": "^0.28.1",
+    "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   }
 }

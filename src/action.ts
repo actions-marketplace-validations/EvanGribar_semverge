@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { resolve, relative, join, basename, sep } from "node:path";
 import { formatChangeReference, parseChange, releaseChannelFromLabels } from "./changes.js";
 import { channelBaseBranch, channelPolicy, parseConfig, withChannelPolicy, withOverrides } from "./config.js";
+import { communicationQualityMarkdown } from "./communication-quality.js";
 import { readinessMarkdown } from "./readiness.js";
 import { releaseTagName, GitHubClient, type GitHubCommitSummary, type GitHubPullRequest, type GitHubRelease } from "./github.js";
 import { discoverPackages } from "./packages.js";
@@ -12,10 +13,11 @@ import { buildWorkspaceReleasePlan, type WorkspaceReleasePlan } from "./workspac
 import { evaluatePostReleaseVerification, postReleaseVerificationMarkdown, versionFromReleaseTag, type PostReleaseVerificationObservation, type PostReleaseVerificationReport } from "./health.js";
 import { compareVersions, parseVersion } from "./semver.js";
 import { assertNpmProvenanceEnvironment, npmPublishCommand, npmVersionExists } from "./npm.js";
-import { ociImageVersionExists, parseOciImageRepository, publishConfigForEcosystem, publisherName, registryVersionExists, renderOciPublishCommand } from "./registries.js";
+import { ociImageVersionDigest, ociImageVersionExists, parseOciImageRepository, publishConfigForEcosystem, publisherName, registryVersionExists, renderOciPublishCommand } from "./registries.js";
 import { assertWorkspaceAtCommit } from "./workspace-integrity.js";
 import { advanceReleaseTransaction, createReleaseTransaction, mergeReleaseTransactions, parseReleaseTransactionBody, recordReleaseTransactionEvent, releaseTransactionBody, updateReleaseTransactionBody, type ReleaseTransaction } from "./transaction.js";
 import { createPluginRegistryFromConfig, runTransactionOwnedPluginHook, type ReleasePluginPackage } from "./plugin-sdk.js";
+import { buildAiReleaseNotesPreview, type AiReleaseNotesPreview } from "./release-assistance.js";
 import type { Ecosystem, SemVergeConfig } from "./types.js";
 
 const exec = promisify(execCallback);
@@ -238,7 +240,72 @@ function releaseGraphMarkdown(plan: WorkspaceReleasePlan): string[] {
   return lines;
 }
 
-function releasePrBody(plan: WorkspaceReleasePlan, config: SemVergeConfig): string {
+interface AiReleaseNotesPackagePreview {
+  packageName: string;
+  preview: AiReleaseNotesPreview;
+}
+
+function aiReleaseNotesMarkdown(previews: AiReleaseNotesPackagePreview[]): string[] {
+  if (previews.length === 0) {
+    return [];
+  }
+  const lines = [
+    "## AI-enhanced customer notes (review draft)",
+    "",
+    "These notes are advisory. The deterministic customer notes above remain authoritative until a human reviews and explicitly applies a draft.",
+    ""
+  ];
+  for (const { packageName, preview } of previews) {
+    lines.push(`### ${packageName}`, "", `- Status: **${preview.status}**`);
+    if (preview.status === "generated" && preview.rendered) {
+      lines.push("", "#### AI draft", "", preview.rendered.trim(), "", "#### Deterministic baseline", "", preview.deterministic.trim());
+    } else {
+      lines.push(`- Deterministic fallback retained: **${preview.deterministic ? "yes" : "no"}**`);
+      if (preview.reason) lines.push(`- Provider status: **${preview.reason}**`);
+    }
+    lines.push("");
+  }
+  return lines;
+}
+
+function releaseFilesMarkdown(plan: WorkspaceReleasePlan, config: SemVergeConfig): string[] {
+  const changedFiles = [...new Set([
+    ...plan.versionChanges.map((change) => change.path),
+    ...plan.outputs.map((output) => output.path)
+  ])].sort();
+  const customFiles = config.versionFiles.map((item) => item.path);
+  const lines = [
+    "## Release files",
+    "",
+    "The release commit will update:",
+    ...(changedFiles.length > 0 ? changedFiles.map((path) => `- \`${path}\``) : ["- No generated files."])
+  ];
+  if (customFiles.length > 0) {
+    lines.push("", "Configured version locations:", ...customFiles.map((path) => `- [ ] Review selector for \`${path}\``));
+  }
+  return lines;
+}
+
+function releaseOperatorChecklist(plan: WorkspaceReleasePlan, config: SemVergeConfig): string[] {
+  const publicationTargets = [
+    ...(config.publishing.npm.enabled ? ["npm"] : []),
+    ...(config.publishing.python.enabled ? ["PyPI"] : []),
+    ...(config.publishing.rust.enabled ? ["crates.io"] : []),
+    ...(config.publishing.oci.enabled ? ["OCI images"] : [])
+  ];
+  return [
+    "## Operator checklist",
+    "",
+    `- [${plan.readiness.passed ? "x" : " "}] Readiness checks ${plan.readiness.passed ? "pass" : "are resolved before publication"}.`,
+    `- [${config.versionFiles.length > 0 ? " " : "x"}] Review repository-owned version-file selectors and generated file changes.`,
+    `- [${publicationTargets.length > 0 ? " " : "x"}] Confirm workflow permissions and credentials for ${publicationTargets.length > 0 ? publicationTargets.join(", ") : "the GitHub release only"}.`,
+    "- [ ] Merge this pull request only after the version graph, customer notes, and recovery path are understood.",
+    "",
+    "If a side effect is interrupted, use `semverge recover <release-id>`; the transaction marker is retained in the release body."
+  ];
+}
+
+function releasePrBody(plan: WorkspaceReleasePlan, config: SemVergeConfig, aiReleaseNotes: AiReleaseNotesPackagePreview[] = []): string {
   const marker = JSON.stringify({ version: plan.version, manifest: config.outputs.manifest, mode: plan.mode, channel: plan.channel, promotion: plan.promotion });
   const packageLines = plan.packages.map(({ package: packageItem, plan: packagePlan }) => `- **${packageItem.name}**: ${packageItem.version} -> **${packagePlan.version}** (${packagePlan.bump}, ${packagePlan.channel}${packagePlan.promotion ? ", promotion" : ""})`);
   const notes = plan.packages.map(({ package: packageItem, plan: packagePlan }) => `### ${packageItem.name}\n\n${packagePlan.customerNotes.trim()}`).join("\n\n");
@@ -259,11 +326,19 @@ function releasePrBody(plan: WorkspaceReleasePlan, config: SemVergeConfig): stri
     "",
     readinessMarkdown(plan.readiness).trim(),
     "",
+    ...communicationQualityMarkdown(plan.communicationQuality ?? []),
+    "",
     ...releaseGraphMarkdown(plan),
+    "",
+    ...releaseFilesMarkdown(plan, config),
+    "",
+    ...releaseOperatorChecklist(plan, config),
     "",
     "## Customer-facing notes",
     "",
-    notes || "No customer-facing changes were marked for this release.",
+    notes || "No customer-facing updates are included in this release.",
+    "",
+    ...aiReleaseNotesMarkdown(aiReleaseNotes),
     "",
     "---",
     "Generated by SemVerge. Merge this pull request to publish the tag and GitHub release."
@@ -478,7 +553,8 @@ async function prepareRelease(client: GitHubClient, head: string, config: SemVer
   const baseCommit = await client.getCommit(head);
   const repositoryTree = await client.getTree(baseCommit.tree.sha);
   const allPaths = repositoryTree.filter((entry) => entry.type === "blob").map((entry) => entry.path);
-  const manifestPaths = allPaths.filter((path) => path === "package.json" || path.endsWith("/package.json") || path === "pyproject.toml" || path.endsWith("/pyproject.toml") || path === "Cargo.toml" || path.endsWith("/Cargo.toml") || path === "pnpm-workspace.yaml");
+  const configuredVersionPaths = new Set(config.versionFiles.map((item) => item.path));
+  const manifestPaths = allPaths.filter((path) => configuredVersionPaths.has(path) || path === "package.json" || path.endsWith("/package.json") || path === "pyproject.toml" || path.endsWith("/pyproject.toml") || path === "Cargo.toml" || path.endsWith("/Cargo.toml") || path === "pnpm-workspace.yaml");
   const manifestEntries = await Promise.all(manifestPaths.map(async (path) => [path, await fileAtHead(client, path, head)] as const));
   const manifestFiles = Object.fromEntries(manifestEntries.flatMap(([path, content]) => content === null ? [] : [[path, content]]));
   const discovered = discoverPackages(manifestFiles, allPaths, config);
@@ -547,6 +623,18 @@ async function prepareRelease(client: GitHubClient, head: string, config: SemVer
     return;
   }
 
+  const aiReleaseNotes: AiReleaseNotesPackagePreview[] = effectiveConfig.ai?.enabled && effectiveConfig.ai.releaseNotes === true
+    ? await Promise.all(plan.packages.map(async ({ package: packageItem, plan: packagePlan }) => ({
+      packageName: packageItem.name,
+      preview: await buildAiReleaseNotesPreview(packagePlan, effectiveConfig.ai)
+    })))
+    : [];
+  for (const { packageName, preview } of aiReleaseNotes) {
+    if (preview.status === "unavailable") {
+      log(`AI release-notes draft unavailable for ${packageName} (${preview.reason ?? "provider"}); deterministic notes were retained.`);
+    }
+  }
+
   const repository = await client.repositoryInfo();
   const entries = new Map<string, string>(Object.entries(fileMapFromPlan(plan)));
   for (const change of plan.versionChanges) {
@@ -563,7 +651,7 @@ async function prepareRelease(client: GitHubClient, head: string, config: SemVer
 
   const titleVersion = plan.mode === "independent" ? plan.version : releaseTagName(effectiveConfig.release.tagPrefix, plan.version);
   const title = `chore(release): ${titleVersion}`;
-  const body = releasePrBody(plan, effectiveConfig);
+  const body = releasePrBody(plan, effectiveConfig, aiReleaseNotes);
   const existing = (await client.listPullRequests({ state: "open", head: `${repository.owner.login}:${effectiveConfig.release.branch}`, base: baseBranch }))[0];
   const releasePr = existing ? await client.updatePullRequest(existing.number, { title, body }) : await client.createPullRequest({ title, body, head: effectiveConfig.release.branch, base: baseBranch });
   setOutput("release-pr", releasePr.html_url);
@@ -663,6 +751,22 @@ function releaseBody(customerNotes: string, progress: ReleaseProgress): string {
 
 function mergeReleaseProgress(states: Array<ReleaseProgress | null>, expected: ReleaseProgress): ReleaseProgress {
   return mergeReleaseTransactions(states, expected);
+}
+
+async function recordOciDigest(progress: ReleaseProgress, image: string, version: string, idempotency: "registry" | "declared" | undefined): Promise<ReleaseProgress> {
+  if (idempotency !== "registry") {
+    return progress;
+  }
+  try {
+    const digest = await ociImageVersionDigest(image, version);
+    if (digest) {
+      progress.ociDigests ??= {};
+      progress.ociDigests[image] = digest;
+    }
+  } catch (error) {
+    log(`Could not record the OCI digest for ${image}:${version}; release verification will report the digest evidence as unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return progress;
 }
 
 async function persistReleaseProgress(client: GitHubClient, executions: ReleaseExecution[], progress: ReleaseProgress, finalize = false): Promise<void> {
@@ -812,6 +916,7 @@ async function publishRelease(client: GitHubClient, pr: GitHubPullRequest, confi
     changes: [],
     config
   };
+  const executions: ReleaseExecution[] = [];
   const persist = async (tx: ReleaseTransaction) => {
     progress = tx;
     if (executions.length > 0) {
@@ -825,8 +930,6 @@ async function publishRelease(client: GitHubClient, pr: GitHubPullRequest, confi
 
   const buildRes = await runTransactionOwnedPluginHook(pluginRegistry, "build", pluginContextInput, progress, recordReleaseTransactionEvent, persist);
   if (buildRes.transaction) progress = buildRes.transaction;
-
-  const executions: ReleaseExecution[] = [];
 
   for (const item of releaseInputs) {
     let release = item.existingRelease;
@@ -875,7 +978,9 @@ async function publishRelease(client: GitHubClient, pr: GitHubPullRequest, confi
     const alreadyPublished = publisher.idempotency === "registry"
       ? ecosystem === "node"
         ? await npmVersionExists(packageItem.name, packageItem.version, packageWorkspace)
-        : await registryVersionExists(ecosystem, packageItem.name, packageItem.version)
+        : ecosystem === "python" || ecosystem === "rust"
+          ? await registryVersionExists(ecosystem, packageItem.name, packageItem.version)
+          : false
       : false;
     if (alreadyPublished) {
       log(`Found ${packageItem.name}@${packageItem.version} in the ${publisherName(ecosystem)} registry; treating publication as already complete.`);
@@ -908,6 +1013,7 @@ async function publishRelease(client: GitHubClient, pr: GitHubPullRequest, confi
       if (alreadyPublished) {
         log(`Found ${image}:${ociVersion} in the OCI registry; treating publication as already complete.`);
         progress.publishedOciImages = [...new Set([...progress.publishedOciImages, image])];
+        progress = await recordOciDigest(progress, image, ociVersion, ociConfig.idempotency);
         progress = recordReleaseTransactionEvent(progress, { key: `oci:${image}`, kind: "oci-image-published", target: `${image}:${ociVersion}`, detail: "The OCI registry already contains the requested image tag; no duplicate push was attempted." });
         await persistReleaseProgress(client, executions, progress);
         continue;
@@ -923,6 +1029,7 @@ async function publishRelease(client: GitHubClient, pr: GitHubPullRequest, confi
         throw error;
       }
       progress.publishedOciImages = [...new Set([...progress.publishedOciImages, image])];
+      progress = await recordOciDigest(progress, image, ociVersion, ociConfig.idempotency);
       progress = recordReleaseTransactionEvent(progress, { key: `oci:${image}`, kind: "oci-image-published", target: `${image}:${ociVersion}` });
       await persistReleaseProgress(client, executions, progress);
     }

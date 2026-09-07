@@ -1,6 +1,8 @@
 import { parse as parseYaml } from "yaml";
 import { parseOciImageRepository } from "./registries.js";
-import type { ArtifactConfig, BumpLevel, HealthMonitoringConfig, HealthWorkflow, NpmPublishConfig, OciPublishConfig, OutputConfig, ReadinessCommand, ReadinessTask, RegistryPublishConfig, ReleaseChannelPolicy, ReleasePromotion, SemVergeConfig } from "./types.js";
+import { DEFAULT_AI_TIMEOUT_MS } from "./types.js";
+import type { AiConfig, AiTone, AiVerbosity, ArtifactConfig, BumpLevel, CommunicationConfig, CustomerQualityConfig, HealthMonitoringConfig, HealthWorkflow, NpmPublishConfig, OciPublishConfig, OutputConfig, ReadinessCommand, ReadinessTask, RegistryPublishConfig, ReleaseChannelPolicy, ReleasePromotion, SemVergeConfig, VersionFileConfig } from "./types.js";
+import { validateVersionFileConfig } from "./version-updaters.js";
 
 export type ConfigValidationSeverity = "error" | "warning";
 
@@ -42,6 +44,13 @@ export const DEFAULT_CONFIG: SemVergeConfig = {
     manifest: "release-manifest.json",
     announcement: "RELEASE_ANNOUNCEMENT.md"
   },
+  versionFiles: [],
+  communication: {
+    customerQuality: {
+      mode: "warn",
+      allowTerms: []
+    }
+  },
   artifacts: {
     paths: []
   },
@@ -68,6 +77,12 @@ export const DEFAULT_CONFIG: SemVergeConfig = {
       comment: true,
       checkRun: false
     }
+  },
+  ai: {
+    enabled: false,
+    provider: "openai",
+    model: "",
+    timeoutMs: DEFAULT_AI_TIMEOUT_MS
   },
   publishing: {
     npm: {
@@ -268,6 +283,25 @@ export function validateConfigContent(content: string, fileName = ".semverge.yml
       stringField(outputs, key, "outputs", issues);
     }
   }
+  if (raw.versionFiles !== undefined) {
+    if (!Array.isArray(raw.versionFiles)) {
+      issues.push({ path: "versionFiles", severity: "error", message: "must be an array of version-file descriptors" });
+    } else {
+      raw.versionFiles.forEach((item, index) => {
+        for (const message of validateVersionFileConfig(item)) {
+          issues.push({ path: `versionFiles[${index}]`, severity: "error", message });
+        }
+      });
+    }
+  }
+  const communication = section(raw, "communication", issues);
+  if (communication) {
+    const customerQuality = section(communication, "customerQuality", issues);
+    if (customerQuality) {
+      enumField(customerQuality, "mode", "communication.customerQuality", ["off", "warn", "error"], issues);
+      stringArrayField(customerQuality, "allowTerms", "communication.customerQuality", issues);
+    }
+  }
   const artifacts = section(raw, "artifacts", issues);
   if (artifacts) {
     stringField(artifacts, "command", "artifacts", issues);
@@ -315,6 +349,23 @@ export function validateConfigContent(content: string, fileName = ".semverge.yml
       issues.push({ path: "health.hotfixWindowHours", severity: "warning", message: "hotfix detection is no longer performed during immediate post-release verification" });
     }
   }
+  const ai = section(raw, "ai", issues);
+  if (ai) {
+    booleanField(ai, "enabled", "ai", issues);
+    booleanField(ai, "releaseNotes", "ai", issues);
+    booleanField(ai, "infer", "ai", issues);
+    enumField(ai, "provider", "ai", ["openai"], issues);
+    enumField(ai, "tone", "ai", ["neutral", "friendly", "professional"], issues);
+    enumField(ai, "verbosity", "ai", ["concise", "standard", "detailed"], issues);
+    stringField(ai, "model", "ai", issues);
+    numberField(ai, "timeoutMs", "ai", issues);
+    if (typeof ai.timeoutMs === "number" && Number.isFinite(ai.timeoutMs) && (!Number.isInteger(ai.timeoutMs) || ai.timeoutMs <= 0)) {
+      issues.push({ path: "ai.timeoutMs", severity: "error", message: "must be a positive integer" });
+    }
+    if (ai.enabled === true && (ai.model === undefined || (typeof ai.model === "string" && !ai.model.trim()))) {
+      issues.push({ path: "ai.model", severity: "error", message: "must be a non-empty string when AI is enabled" });
+    }
+  }
   const publishing = section(raw, "publishing", issues);
   if (publishing) {
     const npm = section(publishing, "npm", issues);
@@ -359,6 +410,31 @@ export function validateConfig(config: SemVergeConfig): ConfigValidationIssue[] 
   }
   if (!config.release.tagPrefix) {
     issues.push({ path: "release.tagPrefix", severity: "warning", message: "is empty; generated release tags will not have a prefix" });
+  }
+  if (config.ai) {
+    if (config.ai.enabled && !config.ai.model.trim()) {
+      issues.push({ path: "ai.model", severity: "error", message: "must be a non-empty string when AI is enabled" });
+    }
+    if (config.ai.provider !== "openai") {
+      issues.push({ path: "ai.provider", severity: "error", message: "must be one of: openai" });
+    }
+    if (!Number.isInteger(config.ai.timeoutMs) || config.ai.timeoutMs <= 0) {
+      issues.push({ path: "ai.timeoutMs", severity: "error", message: "must be a positive integer" });
+    }
+    if (config.ai.tone !== undefined && !["neutral", "friendly", "professional"].includes(config.ai.tone)) {
+      issues.push({ path: "ai.tone", severity: "error", message: "must be one of: neutral, friendly, professional" });
+    }
+    if (config.ai.verbosity !== undefined && !["concise", "standard", "detailed"].includes(config.ai.verbosity)) {
+      issues.push({ path: "ai.verbosity", severity: "error", message: "must be one of: concise, standard, detailed" });
+    }
+  }
+  if (config.communication) {
+    if (!(["off", "warn", "error"] as const).includes(config.communication.customerQuality.mode)) {
+      issues.push({ path: "communication.customerQuality.mode", severity: "error", message: "must be one of: off, warn, error" });
+    }
+    if (config.communication.customerQuality.allowTerms.some((term) => !term.trim())) {
+      issues.push({ path: "communication.customerQuality.allowTerms", severity: "error", message: "must contain only non-empty strings" });
+    }
   }
   for (const [name, policy] of Object.entries(config.release.channels)) {
     if (!policy.label.trim()) {
@@ -522,6 +598,65 @@ function healthMonitoring(value: unknown, fallback: HealthMonitoringConfig): Hea
   };
 }
 
+function aiSettings(value: unknown, fallback: AiConfig): AiConfig {
+  const object = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const result: AiConfig = {
+    enabled: booleanValue(object.enabled, fallback.enabled),
+    provider: object.provider === "openai" ? "openai" : fallback.provider,
+    model: typeof object.model === "string" ? object.model.trim() : fallback.model,
+    timeoutMs: typeof object.timeoutMs === "number" && Number.isInteger(object.timeoutMs) && object.timeoutMs > 0 ? object.timeoutMs : fallback.timeoutMs
+  };
+  if (typeof object.releaseNotes === "boolean") {
+    result.releaseNotes = object.releaseNotes;
+  }
+  if (typeof object.infer === "boolean") {
+    result.infer = object.infer;
+  }
+  if (object.tone === "neutral" || object.tone === "friendly" || object.tone === "professional") {
+    result.tone = object.tone as AiTone;
+  }
+  if (object.verbosity === "concise" || object.verbosity === "standard" || object.verbosity === "detailed") {
+    result.verbosity = object.verbosity as AiVerbosity;
+  }
+  return result;
+}
+
+function versionFiles(value: unknown): VersionFileConfig[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item): VersionFileConfig[] => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return [];
+    }
+    const record = item as Record<string, unknown>;
+    if (typeof record.path !== "string" || !record.path.trim() || (record.format !== "json" && record.format !== "yaml" && record.format !== "toml" && record.format !== "text" && record.format !== "xml")) {
+      return [];
+    }
+    const result: VersionFileConfig = { path: record.path.trim().replace(/\\/g, "/").replace(/^\.\//, ""), format: record.format };
+    if (typeof record.property === "string" && record.property.trim()) result.property = record.property.trim();
+    if (typeof record.pattern === "string" && record.pattern) result.pattern = record.pattern;
+    if (typeof record.xpath === "string" && record.xpath.trim()) result.xpath = record.xpath.trim();
+    if (typeof record.package === "string" && record.package.trim()) result.package = record.package.trim();
+    return [result];
+  });
+}
+
+function customerQualitySettings(value: unknown, fallback: CustomerQualityConfig): CustomerQualityConfig {
+  const object = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  return {
+    mode: object.mode === "off" || object.mode === "warn" || object.mode === "error" ? object.mode : fallback.mode,
+    allowTerms: strings(object.allowTerms)
+  };
+}
+
+function communicationSettings(value: unknown, fallback: CommunicationConfig): CommunicationConfig {
+  const object = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  return {
+    customerQuality: customerQualitySettings(object.customerQuality, fallback.customerQuality)
+  };
+}
+
 function channelPolicies(value: unknown): Record<string, ReleaseChannelPolicy> {
   const result: Record<string, ReleaseChannelPolicy> = Object.fromEntries(Object.entries(DEFAULT_CHANNEL_POLICIES).map(([name, policy]) => [name, { ...policy }]));
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -561,11 +696,14 @@ function mergeConfig(raw: unknown): SemVergeConfig {
   const release = object.release && typeof object.release === "object" ? object.release as Record<string, unknown> : {};
   const readiness = object.readiness && typeof object.readiness === "object" ? object.readiness as Record<string, unknown> : {};
   const outputs = object.outputs && typeof object.outputs === "object" ? object.outputs as Record<string, unknown> : {};
+  const configuredVersionFiles = object.versionFiles;
   const artifacts = object.artifacts && typeof object.artifacts === "object" ? object.artifacts as Record<string, unknown> : {};
   const monorepo = object.monorepo && typeof object.monorepo === "object" ? object.monorepo as Record<string, unknown> : {};
   const dependencyPolicy = monorepo.dependencyPolicy && typeof monorepo.dependencyPolicy === "object" ? monorepo.dependencyPolicy as Record<string, unknown> : {};
   const health = object.health && typeof object.health === "object" ? object.health as Record<string, unknown> : {};
   const healthMonitoringValue = health.monitoring;
+  const communication = object.communication && typeof object.communication === "object" ? object.communication as Record<string, unknown> : {};
+  const ai = object.ai && typeof object.ai === "object" ? object.ai as Record<string, unknown> : {};
   const publishing = object.publishing && typeof object.publishing === "object" ? object.publishing as Record<string, unknown> : {};
   const npm = publishing.npm && typeof publishing.npm === "object" ? publishing.npm as Record<string, unknown> : {};
   const python = publishing.python;
@@ -597,6 +735,7 @@ function mergeConfig(raw: unknown): SemVergeConfig {
       manifest: typeof outputs.manifest === "string" && outputs.manifest.trim() ? outputs.manifest.trim() : DEFAULT_CONFIG.outputs.manifest,
       announcement: typeof outputs.announcement === "string" && outputs.announcement.trim() ? outputs.announcement.trim() : DEFAULT_CONFIG.outputs.announcement
     },
+    versionFiles: versionFiles(configuredVersionFiles),
     artifacts: {
       paths: strings(artifacts.paths)
     },
@@ -619,6 +758,8 @@ function mergeConfig(raw: unknown): SemVergeConfig {
       requiredLinks: strings(health.requiredLinks),
       monitoring: healthMonitoring(healthMonitoringValue, DEFAULT_CONFIG.health.monitoring as HealthMonitoringConfig)
     },
+    communication: communicationSettings(communication, DEFAULT_CONFIG.communication as CommunicationConfig),
+    ai: aiSettings(ai, DEFAULT_CONFIG.ai as AiConfig),
     publishing: {
       npm: {
         enabled: booleanValue(npm.enabled, DEFAULT_CONFIG.publishing.npm.enabled),
@@ -666,10 +807,13 @@ export function withOverrides(config: SemVergeConfig, overrides: { prerelease?: 
     release: { ...config.release, channels: Object.fromEntries(Object.entries(config.release.channels).map(([name, policy]) => [name, { ...policy }])) },
     readiness: { ...config.readiness, requiredLabels: [...config.readiness.requiredLabels], requiredFiles: [...config.readiness.requiredFiles], commands: [...config.readiness.commands], tasks: [...config.readiness.tasks] },
     outputs: { ...config.outputs },
+    versionFiles: config.versionFiles.map((item) => ({ ...item })),
     artifacts: { ...config.artifacts, paths: [...config.artifacts.paths] },
     monorepo: { ...config.monorepo, packages: [...config.monorepo.packages], dependencyPolicy: { ...config.monorepo.dependencyPolicy } },
     health: { ...config.health, workflows: [...config.health.workflows], expectedArtifacts: [...config.health.expectedArtifacts], requiredLinks: [...config.health.requiredLinks], ...(config.health.monitoring ? { monitoring: { ...config.health.monitoring } } : {}) },
     publishing: { ...config.publishing, npm: { ...config.publishing.npm }, python: { ...config.publishing.python }, rust: { ...config.publishing.rust }, oci: { ...config.publishing.oci, images: [...config.publishing.oci.images] } },
+    ...(config.communication ? { communication: { ...config.communication, customerQuality: { ...config.communication.customerQuality, allowTerms: [...config.communication.customerQuality.allowTerms] } } } : {}),
+    ...(config.ai ? { ai: { ...config.ai } } : {}),
     ...(config.plugins ? { plugins: [...config.plugins] } : {})
   };
   const prerelease = overrides.prerelease?.trim();

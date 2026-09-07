@@ -1,5 +1,5 @@
 import { formatChangeReference } from "./changes.js";
-import type { ReleaseChange } from "./types.js";
+import type { CustomerCommunication, CustomerImpact, ReleaseChange } from "./types.js";
 
 function section(title: string, changes: ReleaseChange[]): string[] {
   if (changes.length === 0) {
@@ -10,24 +10,6 @@ function section(title: string, changes: ReleaseChange[]): string[] {
 
 function uniqueLines(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
-}
-
-function listWithAnd(values: string[]): string {
-  if (values.length <= 1) {
-    return values[0] ?? "";
-  }
-  if (values.length === 2) {
-    return `${values[0]} and ${values[1]}`;
-  }
-  return `${values.slice(0, -1).join(", ")}, and ${values.at(-1)}`;
-}
-
-function countLabel(count: number, singular: string): string {
-  if (count === 1) {
-    return `1 ${singular}`;
-  }
-  const plural = singular === "fix" ? "fixes" : `${singular}s`;
-  return `${count} ${plural}`;
 }
 
 function sentence(value: string): string {
@@ -45,27 +27,74 @@ function highestImpactChange(changes: ReleaseChange[]): ReleaseChange | undefine
     .at(0)?.change;
 }
 
-function customerReleaseSummary(customerChanges: ReleaseChange[], breaking: ReleaseChange[], features: ReleaseChange[], fixes: ReleaseChange[]): string {
+function inferredImpact(change: ReleaseChange): CustomerImpact {
+  if (change.breaking || change.kind === "breaking") {
+    return "changed";
+  }
+  if (change.kind === "feature") {
+    return "new";
+  }
+  if (change.kind === "fix") {
+    return "fixed";
+  }
+  return "improved";
+}
+
+function customerCommunication(change: ReleaseChange): CustomerCommunication {
+  const communication = change.customerCommunication ?? {
+    outcome: change.customerSummary,
+    impact: inferredImpact(change)
+  };
+  return change.breaking || change.kind === "breaking"
+    ? { ...communication, impact: "changed" }
+    : communication;
+}
+
+function customerReleaseSummary(customerChanges: ReleaseChange[]): string {
   if (customerChanges.length === 0) {
-    return "No customer-facing changes were marked for this release.";
+    return "No customer-facing updates are included in this release.";
   }
-  const counts = [
-    features.length > 0 ? countLabel(features.length, "feature") : undefined,
-    fixes.length > 0 ? countLabel(fixes.length, "fix") : undefined,
-    breaking.length > 0 ? countLabel(breaking.length, "breaking change") : undefined
-  ].filter((value): value is string => Boolean(value));
   const lead = highestImpactChange(customerChanges);
-  const lines = [`This release includes ${listWithAnd(counts)}.`];
-  if (lead) {
-    lines.push(`Highest-impact change: ${sentence(lead.customerSummary)}`);
-  }
-  if (breaking.length > 0) {
-    lines.push("Breaking changes require review before upgrading.");
-  }
-  if (customerChanges.some((change) => change.migration)) {
-    lines.push("Migration guidance is included with this release.");
+  const lines = [sentence(customerCommunication(lead!).outcome)];
+  const breaking = customerChanges.some((change) => change.breaking || change.kind === "breaking");
+  if (breaking) {
+    lines.push("Existing behavior changes in this release; review the required action before upgrading.");
   }
   return lines.join(" ");
+}
+
+function customerSection(title: string, changes: ReleaseChange[]): string[] {
+  if (changes.length === 0) {
+    return [];
+  }
+  const lines = [`## ${title}`, ""];
+  for (const change of changes) {
+    const communication = customerCommunication(change);
+    const copy = [communication.outcome, communication.detail].filter((value): value is string => Boolean(value?.trim())).map(sentence);
+    if (communication.headline) {
+      lines.push(`### ${communication.headline}`, "", ...copy, "");
+    } else {
+      lines.push(...copy.map((value) => `- ${value}`), "");
+    }
+  }
+  return lines;
+}
+
+function isNoAction(value: string): boolean {
+  return /^(?:no|none|not)\s+(?:customer\s+)?(?:action|migration)(?:\s+(?:is\s+)?required)?[.!]?$/i.test(value.trim()) || /^n\/a[.!]?$/i.test(value.trim());
+}
+
+function actionRequired(changes: ReleaseChange[]): string[] {
+  const actions = uniqueLines(changes.flatMap((change) => {
+    const communication = customerCommunication(change);
+    return [communication.actionRequired, change.migration].filter((value): value is string => Boolean(value?.trim()));
+  }).filter((value) => !isNoAction(value)));
+  if (actions.length > 0) {
+    return actions;
+  }
+  return changes
+    .filter((change) => change.breaking || change.kind === "breaking")
+    .map((change) => `Review the changed behavior before upgrading: ${customerCommunication(change).outcome}`);
 }
 
 export function renderChangelogSection(version: string, date: string, changes: ReleaseChange[]): string {
@@ -92,15 +121,13 @@ export function prependChangelog(existing: string, releaseSection: string): stri
 
 export function renderCustomerNotes(version: string, changes: ReleaseChange[]): string {
   const customerChanges = changes.filter((change) => !change.skipped && (change.kind === "feature" || change.kind === "fix" || change.kind === "breaking" || change.breaking));
-  const breaking = customerChanges.filter((change) => change.breaking || change.kind === "breaking");
-  const features = customerChanges.filter((change) => !breaking.includes(change) && change.kind === "feature");
-  const fixes = customerChanges.filter((change) => !breaking.includes(change) && change.kind === "fix");
-  const lines = [`# What's new in ${version}`, "", customerReleaseSummary(customerChanges, breaking, features, fixes), ""];
-  lines.push(...section("Highlights", features));
-  lines.push(...section("Improvements and Fixes", fixes));
-  lines.push(...section("Breaking Changes", breaking));
-  if (customerChanges.length === 0) {
-    lines.push("No customer-facing changes were marked for this release.", "");
+  const lines = [`# What's new in ${version}`, "", customerReleaseSummary(customerChanges), ""];
+  for (const [title, impact] of [["New", "new"], ["Improved", "improved"], ["Fixed", "fixed"], ["Changed", "changed"]] as const) {
+    lines.push(...customerSection(title, customerChanges.filter((change) => customerCommunication(change).impact === impact)));
+  }
+  const actions = actionRequired(customerChanges);
+  if (actions.length > 0) {
+    lines.push("## Action required", "", ...actions.map((action) => `- ${sentence(action)}`), "");
   }
   return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trim()}\n`;
 }
@@ -127,16 +154,103 @@ export function renderInternalSummary(version: string, changes: ReleaseChange[])
   return lines.join("\n");
 }
 
-export function renderAnnouncement(version: string, changes: ReleaseChange[]): string {
+export interface AnnouncementView {
+  headline: string;
+  summary: string;
+  highlights: string[];
+  actionRequired: string[];
+  callToAction?: string;
+  authoredCopy?: string[];
+}
+
+function announcementActions(changes: ReleaseChange[]): string[] {
+  const actions = uniqueLines(changes.flatMap((change) => {
+    const communication = customerCommunication(change);
+    return [communication.actionRequired, change.migration].filter((value): value is string => Boolean(value?.trim()));
+  }).filter((value) => !isNoAction(value)));
+  if (actions.length > 0) {
+    return actions;
+  }
+  return changes
+    .filter((change) => change.breaking || change.kind === "breaking")
+    .map((change) => `Review the changed behavior before upgrading: ${customerCommunication(change).outcome}`);
+}
+
+function announcementHeadline(change: ReleaseChange): string {
+  const value = customerCommunication(change).headline ?? customerCommunication(change).outcome;
+  return value.trim().replace(/^[a-z]/, (character) => character.toUpperCase());
+}
+
+function announcementHighlights(changes: ReleaseChange[]): string[] {
+  return changes.map((change) => {
+    const communication = customerCommunication(change);
+    const outcome = sentence(communication.outcome);
+    return communication.headline ? `${communication.headline}: ${outcome}` : outcome;
+  });
+}
+
+export function buildAnnouncementView(version: string, changes: ReleaseChange[]): AnnouncementView {
   const announcements = uniqueLines(changes.flatMap((change) => change.announcement ? [change.announcement] : []));
   const customerChanges = changes.filter((change) => change.kind === "feature" || change.kind === "fix" || change.kind === "breaking" || change.breaking);
-  const lines = [`# SemVerge release announcement: ${version}`, ""];
   if (announcements.length > 0) {
-    lines.push(...announcements, "");
-  } else if (customerChanges.length > 0) {
-    lines.push(`SemVerge ${version} includes:`, "", ...customerChanges.map((change) => `- ${change.customerSummary}`), "");
-  } else {
-    lines.push(`SemVerge ${version} is now available.`, "");
+    return {
+      headline: `SemVerge release announcement: ${version}`,
+      summary: "",
+      highlights: [],
+      actionRequired: [],
+      authoredCopy: announcements
+    };
+  }
+  if (customerChanges.length === 0) {
+    return {
+      headline: `SemVerge ${version}`,
+      summary: "No customer-facing update is announced for this release.",
+      highlights: [],
+      actionRequired: []
+    };
+  }
+  const lead = highestImpactChange(customerChanges);
+  if (!lead) {
+    return {
+      headline: `SemVerge ${version}`,
+      summary: "No customer-facing update is announced for this release.",
+      highlights: [],
+      actionRequired: []
+    };
+  }
+  const actionRequired = announcementActions(customerChanges);
+  const summaryLines = [sentence(customerCommunication(lead).outcome)];
+  if (customerChanges.some((change) => change.breaking || change.kind === "breaking")) {
+    summaryLines.push("Existing behavior changes in this release; review the required action before upgrading.");
+  }
+  return {
+    headline: announcementHeadline(lead),
+    summary: summaryLines.join(" "),
+    highlights: announcementHighlights(customerChanges),
+    actionRequired,
+    callToAction: `SemVerge ${version} is available now.`
+  };
+}
+
+export function renderAnnouncementView(view: AnnouncementView): string {
+  const lines = [`# ${view.headline}`, ""];
+  if (view.authoredCopy) {
+    lines.push(...view.authoredCopy, "");
+    return lines.join("\n");
+  }
+  lines.push(view.summary, "");
+  if (view.highlights.length > 0) {
+    lines.push("## Highlights", "", ...view.highlights.map((highlight) => `- ${highlight}`), "");
+  }
+  if (view.actionRequired.length > 0) {
+    lines.push("## Action required", "", ...view.actionRequired.map((action) => `- ${sentence(action)}`), "");
+  }
+  if (view.callToAction) {
+    lines.push(view.callToAction, "");
   }
   return lines.join("\n");
+}
+
+export function renderAnnouncement(version: string, changes: ReleaseChange[]): string {
+  return renderAnnouncementView(buildAnnouncementView(version, changes));
 }

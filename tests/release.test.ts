@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseChange } from "../src/changes.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
+import { buildAnnouncementView, renderAnnouncement, renderCustomerNotes } from "../src/notes.js";
 import { buildReleasePlan } from "../src/release.js";
 
 describe("release planning", () => {
@@ -31,9 +32,11 @@ describe("release planning", () => {
     ]);
     expect(plan.outputs[0]?.content).toContain("## [2.5.0] - 2026-08-04");
     expect(plan.customerNotes).toContain("add bulk export");
-    expect(plan.customerNotes).toContain("This release includes 1 feature and 1 fix.");
-    expect(plan.customerNotes).toContain("Highest-impact change: add bulk export.");
-    expect(plan.customerNotes).not.toContain("A clear summary of the changes included in this release.");
+    expect(plan.customerNotes).toContain("## New");
+    expect(plan.customerNotes).toContain("## Fixed");
+    expect(plan.customerNotes).not.toContain("This release includes 1 feature and 1 fix.");
+    expect(plan.customerNotes).not.toContain("Highest-impact change");
+    expect(plan.customerNotes).not.toContain("## Breaking Changes");
     expect(plan.internalSummary).toContain("update tooling");
   });
 
@@ -51,12 +54,106 @@ describe("release planning", () => {
       ]
     });
 
-    expect(plan.customerNotes).toContain("This release includes 1 feature, 1 fix, and 1 breaking change.");
-    expect(plan.customerNotes).toContain("Highest-impact change: normalize export responses.");
-    expect(plan.customerNotes).toContain("Breaking changes require review before upgrading.");
-    expect(plan.customerNotes).toContain("Migration guidance is included with this release.");
+    expect(plan.customerNotes).toContain("normalize export responses.");
+    expect(plan.customerNotes).toContain("Existing behavior changes in this release; review the required action before upgrading.");
+    expect(plan.customerNotes).toContain("## Changed");
+    expect(plan.customerNotes).toContain("## Action required");
+    expect(plan.customerNotes).not.toContain("This release includes 1 feature, 1 fix, and 1 breaking change.");
+    expect(plan.customerNotes).not.toContain("Highest-impact change");
+    expect(plan.customerNotes).not.toContain("Migration guidance is included with this release.");
     expect(plan.migrationGuide).toContain("Update clients to read data.items.");
     expect(plan.announcement).toContain("Export responses now use the normalized shape.");
+  });
+
+  it("renders authored customer communication instead of raw commit descriptions", () => {
+    const change = parseChange({
+      title: "feat: internal-export-implementation-name",
+      source: "pull_request",
+      body: `<!-- semverge
+headline: Bulk project exports
+outcome: Teams can download multiple projects in one step.
+-->`
+    });
+
+    const notes = renderCustomerNotes("1.1.0", [change]);
+    expect(notes).toContain("Bulk project exports");
+    expect(notes).toContain("Teams can download multiple projects in one step.");
+    expect(notes).not.toContain("internal-export-implementation-name");
+  });
+
+  it("omits migration boilerplate for an explicit no-action release", () => {
+    const change = parseChange({
+      title: "fix: improve export retries",
+      source: "pull_request",
+      body: "<!-- semverge\naction: No action is required.\n-->"
+    });
+
+    const notes = renderCustomerNotes("1.0.1", [change]);
+    expect(notes).not.toContain("## Action required");
+    expect(notes).not.toContain("Migration");
+  });
+
+  it("renders internal-only releases as a sensible no-update result", () => {
+    const notes = renderCustomerNotes("1.0.0", [parseChange({ title: "chore: refresh tooling", source: "commit" })]);
+
+    expect(notes).toBe("# What's new in 1.0.0\n\nNo customer-facing updates are included in this release.\n");
+    expect(notes).not.toContain("refresh tooling");
+  });
+
+  it("renders announcements as a separate external-facing view", () => {
+    const changes = [
+      parseChange({
+        title: "feat: add bulk export",
+        source: "pull_request",
+        body: "<!-- semverge\nheadline: Bulk project exports\noutcome: Teams can export multiple projects in one step.\n-->"
+      }),
+      parseChange({ title: "fix: handle empty exports", source: "pull_request" })
+    ];
+
+    const view = buildAnnouncementView("1.4.0", changes);
+    const announcement = renderAnnouncement("1.4.0", changes);
+    expect(view).toMatchObject({
+      headline: "Bulk project exports",
+      summary: "Teams can export multiple projects in one step.",
+      actionRequired: [],
+      callToAction: "SemVerge 1.4.0 is available now."
+    });
+    expect(view.highlights).toHaveLength(2);
+    expect(announcement).toContain("# Bulk project exports");
+    expect(announcement).toContain("## Highlights");
+    expect(announcement).toContain("SemVerge 1.4.0 is available now.");
+    expect(announcement).not.toContain("SemVerge 1.4.0 includes:");
+    expect(announcement).not.toContain("feat:");
+  });
+
+  it("preserves required action in breaking announcements", () => {
+    const announcement = renderAnnouncement("2.0.0", [parseChange({
+      title: "feat!: normalize export responses",
+      source: "pull_request",
+      body: "<!-- semverge\noutcome: API responses now use the normalized shape.\naction: Update clients to read data.items.\n-->"
+    })]);
+
+    expect(announcement).toContain("Existing behavior changes");
+    expect(announcement).toContain("## Action required");
+    expect(announcement).toContain("Update clients to read data.items.");
+  });
+
+  it("gives explicit announcement metadata deterministic precedence", () => {
+    const announcement = renderAnnouncement("1.2.0", [parseChange({
+      title: "feat: add exports",
+      source: "pull_request",
+      body: "<!-- semverge\nannouncement: Try the new export workflow.\n-->"
+    })]);
+
+    expect(announcement).toBe("# SemVerge release announcement: 1.2.0\n\nTry the new export workflow.\n");
+    expect(announcement).not.toContain("## Highlights");
+  });
+
+  it("avoids promotional copy for internal-only releases", () => {
+    const announcement = renderAnnouncement("1.0.0", [parseChange({ title: "chore: refresh tooling", source: "commit" })]);
+
+    expect(announcement).toBe("# SemVerge 1.0.0\n\nNo customer-facing update is announced for this release.\n");
+    expect(announcement).not.toContain("available now");
   });
 
   it("keeps a docs-only change out of the release path", () => {

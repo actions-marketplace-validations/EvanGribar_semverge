@@ -4,7 +4,7 @@ export type ReleaseKind = "feature" | "fix" | "breaking" | "docs" | "internal" |
 
 export type BumpLevel = "none" | "patch" | "minor" | "major";
 
-export type Ecosystem = "node" | "python" | "rust";
+export type Ecosystem = "node" | "python" | "rust" | "generic";
 
 export type MonorepoMode = "auto" | "single" | "fixed" | "independent";
 
@@ -13,6 +13,38 @@ export type WorkspaceDependencyField = "dependencies" | "devDependencies" | "pee
 export type DependencyReleasePolicy = BumpLevel;
 
 export type ReleasePromotion = "stable";
+
+export type CustomerImpact = "new" | "improved" | "fixed" | "changed";
+
+export type AiTone = "neutral" | "friendly" | "professional";
+
+export type AiVerbosity = "concise" | "standard" | "detailed";
+
+export interface CustomerCommunication {
+  headline?: string;
+  outcome: string;
+  detail?: string;
+  impact: CustomerImpact;
+  actionRequired?: string;
+  audience?: string[];
+}
+
+export type AiProviderName = "openai";
+
+export const DEFAULT_AI_TIMEOUT_MS = 10_000;
+
+export interface AiConfig {
+  enabled: boolean;
+  provider: AiProviderName;
+  model: string;
+  timeoutMs: number;
+  /** Generate an advisory release-notes draft in the release PR. */
+  releaseNotes?: boolean;
+  /** Allow the explicit `infer` command to request metadata suggestions. */
+  infer?: boolean;
+  tone?: AiTone;
+  verbosity?: AiVerbosity;
+}
 
 export type PackageReleaseReason = "direct-change" | "dependency-update" | "fixed-workspace";
 
@@ -26,6 +58,12 @@ export interface PackageReleaseExplanation {
 export interface SemVergeMetadata {
   type?: ReleaseKind;
   customer?: string;
+  headline?: string;
+  outcome?: string;
+  detail?: string;
+  impact?: CustomerImpact;
+  action?: string;
+  audience?: string[];
   migration?: string;
   internal?: string;
   announcement?: string;
@@ -65,6 +103,7 @@ export interface ReleaseChange {
   forcedBump?: BumpLevel;
   dependencyUpdate?: boolean;
   customerSummary: string;
+  customerCommunication?: CustomerCommunication;
   internalSummary?: string;
   migration?: string;
   announcement?: string;
@@ -114,6 +153,49 @@ export interface OutputConfig {
   internalSummary: string;
   manifest: string;
   announcement: string;
+}
+
+export type VersionFileFormat = "json" | "yaml" | "toml" | "text" | "xml";
+
+/**
+ * A deterministic version location outside the built-in package manifests.
+ * Structured selectors use a small JSONPath-compatible property syntax;
+ * text patterns use one literal {{version}} placeholder; XML uses a leaf XPath.
+ */
+export interface VersionFileConfig {
+  path: string;
+  format: VersionFileFormat;
+  property?: string;
+  pattern?: string;
+  xpath?: string;
+  package?: string;
+}
+
+export type CommunicationArtifact = "customer-notes" | "announcement";
+
+export type CustomerQualityMode = "off" | "warn" | "error";
+
+export interface CustomerQualityConfig {
+  mode: CustomerQualityMode;
+  allowTerms: string[];
+}
+
+export interface CommunicationConfig {
+  customerQuality: CustomerQualityConfig;
+}
+
+export interface CommunicationQualityFinding {
+  rule: string;
+  message: string;
+  excerpt: string;
+  line: number;
+}
+
+export interface CommunicationQualityReport {
+  artifact: CommunicationArtifact;
+  mode: CustomerQualityMode;
+  passed: boolean;
+  findings: CommunicationQualityFinding[];
 }
 
 export interface ArtifactConfig {
@@ -190,10 +272,13 @@ export interface SemVergeConfig {
   release: ReleaseConfig;
   readiness: ReadinessConfig;
   outputs: OutputConfig;
+  versionFiles: VersionFileConfig[];
   artifacts: ArtifactConfig;
   monorepo: MonorepoConfig;
   health: HealthConfig;
   publishing: PublishingConfig;
+  communication?: CommunicationConfig;
+  ai?: AiConfig;
   plugins?: Array<unknown>;
 }
 
@@ -235,5 +320,6 @@ export interface ReleasePlan {
   announcement: string;
   manifest: string;
   pluginInvocations?: ReleasePluginInvocation[];
+  communicationQuality?: CommunicationQualityReport[];
 }
 

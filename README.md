@@ -1,6 +1,8 @@
 # SemVerge
 
-SemVerge is release automation that understands whether a release is ready and what customers need to know.
+## Release automation for GitHub that knows when you're actually ready to ship
+
+SemVerge automates versioning, readiness checks, customer-facing release notes, and artifact publication for Node.js projects on GitHub.
 
 Its release PR is the control center for versioning, customer communication, migration requirements, and release readiness:
 
@@ -32,6 +34,7 @@ permissions:
 
 jobs:
   semverge:
+    if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       # Required when artifacts.command, artifacts.paths, or npm publishing is enabled.
@@ -43,10 +46,14 @@ jobs:
       # Install the dependencies your build or publish command needs here.
       - uses: EvanGribar/semverge@v0
         # For a security-conscious pin, use a full commit SHA such as:
-        # - uses: EvanGribar/semverge@c0a62caddd16e581b5a1bd3577540c54e0102739
+        # - uses: EvanGribar/semverge@c95260d02a27d3555b727388b58415f533386895
 ```
 
-On pushes to `main`, SemVerge reads conventional commits and merged pull requests, calculates the next semantic version, and maintains a release pull request. When that pull request merges, SemVerge verifies that the runner workspace is checked out at the exact merge commit, builds artifacts, records SHA-256 digests for configured assets, prepares a draft release, publishes configured npm/PyPI/crates.io packages or OCI images, uploads assets, and only then publishes the GitHub release. A durable transaction marker in the release body records explicit phases and side effects, so retries resume completed steps, including registry checks that recognize an already-published package or image tag and a digest check that rejects changed artifacts. The action's `transaction` output exposes the same state as JSON.
+On pushes to `main`, SemVerge reads conventional commits and merged pull requests, calculates the next semantic version, and maintains a release pull request. When that pull request merges, it verifies the exact merge commit, runs the configured readiness checks, builds artifacts, records digests, and publishes the release only after the transaction is complete. The action's `transaction` output exposes durable state for recovery and inspection.
+
+For a read-only external plan, use `contents: read`, `pull-requests: read`, and `dry-run: true`. For release preparation and publication, use the write permissions shown above. See [docs/public-consumer.md](docs/public-consumer.md) for the complete permission matrix, fork behavior, stable-ref policy, and external-consumer fixture.
+
+The clearest adoption path is **Node.js + GitHub + npm/pnpm**. Additional registries, release channels, monorepo modes, and OCI workflows are available in the configuration and adapter documentation, but the core promise stays simple: make releases safer and easier to explain.
 
 The default repository needs no configuration. SemVerge also understands product-oriented labels:
 
@@ -72,13 +79,18 @@ The package includes a small deterministic local workflow for setup and troubles
 npx semverge init       # create .semverge.yml without overwriting it
 npx semverge plan "feat: add bulk export"
 npx semverge explain "feat: add bulk export"
+npx semverge infer "feat: add bulk export" --body "Teams can export several projects." --json
 npx semverge migrate changesets  # inspect an existing release tool
 npx semverge doctor     # report local setup, configuration, and hosted-release signals
 npx semverge recover release_01J... --state .semverge/release-state.json
+npx semverge verify v1.2.3       # verify a published release and its recorded evidence
+npx semverge verify v1.2.3 --json # emit a deterministic CI-friendly report
 ```
 
 `init` is safe by default and requires `--force` to replace an existing file. `plan` prints the same release-plan shape used by the action, `explain` turns that plan into a human-readable decision and recovery guide, while `doctor` reports local package-manager, workspace, tag, release-tool, registry, build, workflow-permission, and configuration signals before a hosted run. It never prints auth settings and cannot prove provider-side eligibility. See [docs/doctor.md](docs/doctor.md).
-`migrate` detects Release Please, Changesets, and semantic-release configuration and produces a conservative report; add `--write` only after reviewing it. `recover` prints the durable transaction state and safe next action. With `GITHUB_REPOSITORY` and a token it searches GitHub releases; `--state` is useful for a local exported marker or fixture. See [docs/migration.md](docs/migration.md).
+`migrate` detects Release Please, Changesets, and semantic-release configuration and produces a conservative report; add `--write` only after reviewing it. `recover` prints the durable transaction state and safe next action. `verify` is read-only: it checks the transaction, source tag, recorded artifact digests, GitHub release assets, configured package registries, npm provenance evidence, and recorded OCI digests where those providers are available. Its report distinguishes `verified`, `mismatch`, `unavailable`, and `not-applicable`; it exits `0` for a complete verification, `1` for integrity mismatches, and `2` when required provider evidence is unavailable. With `GITHUB_REPOSITORY` and a token it verifies the hosted release; `--state` is useful for a local exported marker or fixture. See [docs/verification.md](docs/verification.md) and [docs/migration.md](docs/migration.md).
+
+`infer` is an explicit, advisory metadata suggestion. It can use bounded title/body/label context and safe file paths, but never file contents or diffs; review the returned block before applying it with `--write <body-file>`.
 
 The optional dependency-free [project surface](website/README.md) is Vercel-compatible but not hosted or required. See [docs/vercel.md](docs/vercel.md) for the current no-deployment boundary.
 
@@ -89,10 +101,17 @@ Structured pull-request metadata is optional. Add this hidden block to a pull-re
 ```md
 <!-- semverge
 type: feature
+headline: Bulk project exports
 customer: Add bulk export for projects.
+outcome: Teams can download multiple projects in one step.
+detail: Existing export formats remain unchanged.
+impact: new
+action: No action is required.
 migration: Existing exports continue to work without changes.
 -->
 ```
+
+The legacy `customer` field remains supported; use `outcome`, `detail`, `impact`, `action`, and `audience` when a change needs richer customer communication. See [docs/customer-communication.md](docs/customer-communication.md) for the structured model and deterministic precedence rules.
 
 ## Optional configuration
 
@@ -147,6 +166,25 @@ outputs:
   internalSummary: .semverge/internal-release.md
   manifest: release-manifest.json
 
+# Update release versions in files that are not package manifests.
+versionFiles:
+  - path: Dockerfile
+    format: text
+    pattern: "ARG APP_VERSION={{version}}"
+  - path: deploy/metadata.yaml
+    format: yaml
+    property: image.version
+  # In an independent workspace, bind each custom file to its package.
+  # - path: packages/web/pom.xml
+  #   format: xml
+  #   xpath: /project/version
+  #   package: packages/web
+
+communication:
+  customerQuality:
+    mode: warn # off, warn, or error
+    allowTerms: [API, registry]
+
 artifacts:
   command: npm run build
   paths: [dist, build.zip]
@@ -180,7 +218,18 @@ health:
       purpose: package
     - name: Deploy production
       purpose: deployment
+ai:
+  enabled: true
+  provider: openai
+  model: your-provider-supported-model
+  timeoutMs: 10000
+  releaseNotes: true # review-only draft in the release PR
+  infer: true        # allow the explicit infer command
+  tone: neutral
+  verbosity: standard
 ```
+
+AI assistance is disabled by default. The explicit `assist` command can request advisory release communication, `releaseNotes` can add a review-only draft to a release PR, and `infer` can suggest structured pull-request metadata. All three use the BYOK provider layer; deterministic release facts and artifacts remain authoritative, and provider failures fall back safely. See [docs/ai.md](docs/ai.md) for the data envelope, environment credential, timeout, and fallback contract.
 
 Readiness checks are reported in the release PR. A missing required label or file blocks publication but does not hide the proposed version or generated communication.
 
@@ -188,7 +237,9 @@ Stable promotion is explicit. Add `ship:stable` to a release-bearing change, or 
 
 `release.channels` extends or overrides those built-in channel policies. Each policy supplies a label and prerelease identifier. An optional `branch` limits preparation to pushes from that branch; `baseBranch` selects the release PR target, `releaseBranch` isolates the release PR head, and `tagPrefix` gives the channel its own tag namespace. The action's `release-channel` input enables explicit scheduled or manually dispatched preparation; workflows still own the scheduler and must check out the configured source branch. See [docs/channels.md](docs/channels.md). Channel policies do not create a hosted scheduler or publish to a registry by themselves.
 
-Independent workspaces use `monorepo.dependencyPolicy` to decide which internal dependency fields release a dependent package and at what bump level (`none`, `patch`, `minor`, or `major`). `dependencies`, `optionalDependencies`, and `peerDependencies` default to patch propagation; `devDependencies` default to no dependent release. Internal ranges and lockfiles still follow released package versions, while the release manifest records the dependency field that caused each propagated release.
+`versionFiles` adds deterministic updates for Dockerfiles, deployment metadata, Java/Maven XML, Python/TOML metadata, and other repository-owned version locations. JSON, YAML, and TOML use a property selector; text uses a literal pattern with one `{{version}}` placeholder; XML uses a restricted leaf XPath such as `/project/version` or `//version`. Selectors fail closed when the location is missing or ambiguous, and configured text patterns are never evaluated as regular expressions. Paths are repository-relative. An unbound file receives the release version for single/fixed releases; independent releases must set `package` to a package id, name, directory, or manifest path. A repository without `package.json`, `pyproject.toml`, or `Cargo.toml` can use one or more unbound `versionFiles` as a repository-only generic target; all unbound files must agree on the current version. See [docs/version-updaters.md](docs/version-updaters.md).
+
+Independent workspaces use `monorepo.dependencyPolicy` to decide which internal dependency fields release a dependent package and at what bump level (`none`, `patch`, `minor`, or `major`). `dependencies`, `optionalDependencies`, and `peerDependencies` default to patch propagation; `devDependencies` default to no dependent release. Internal ranges and lockfiles still follow released package versions, while the release manifest records the dependency field that caused each propagated release. Range rewrites support exact, caret, tilde, and corresponding `workspace:` forms; wildcard workspace protocols are preserved, and compound or unsupported ranges fail the release plan with an actionable error instead of being partially rewritten.
 
 The `health` configuration namespace provides immediate post-release verification: configured assets, documentation links, and workflow results visible after the publication transaction or on a `release.published` event. A workflow that has not started or completed is reported as a warning so the check can be rerun after it finishes. `health.monitoring` is a separate opt-in for an explicit scheduled or manually dispatched workflow; it can inspect one `monitor-tag` or recent semantic releases and append an idempotent observation comment and optional check run to the release PR/commit. SemVerge does not create a scheduler, dashboard, or hosted surface.
 
@@ -200,13 +251,13 @@ Set `publishing.npm.provenance: true` only when the built-in `npm publish` comma
 
 ## Plugin SDK
 
-SemVerge now exports a versioned, explicitly registered lifecycle plugin contract with `analyze`, `plan`, `validate`, `prepare`, `build`, `publish`, `upload`, `announce`, `verify`, and `recover` hooks. Plugins return idempotent effect descriptors that can be owned by the durable transaction engine. See [docs/plugin-sdk.md](docs/plugin-sdk.md). The default action does not auto-load third-party code; configured plugin execution will be added behind an explicit trust boundary.
+SemVerge exports a versioned, explicitly registered lifecycle plugin contract with `analyze`, `plan`, `validate`, `prepare`, `build`, `publish`, `upload`, `announce`, `verify`, and `recover` hooks. Plugins return idempotent effect descriptors that are owned by the durable transaction engine. The action loads only plugins explicitly listed in `.semverge.yml`; loading a plugin is code execution, so review and pin every configured package or local module. See [docs/plugin-sdk.md](docs/plugin-sdk.md).
 
 ## Current scope
 
 SemVerge is intentionally Node.js and GitHub first. The dependable path covers single packages, fixed and independent npm/pnpm workspaces, conventional commits, PR label overrides, version and lockfile updates, dependency-aware release graphs, changelog and release notes, readiness rules, idempotent npm/PyPI/crates.io publishing, opt-in OCI image publication, artifacts, GitHub releases, and immediate post-release verification.
 
-Python `pyproject.toml` and Rust `Cargo.toml` package/workspace discovery, deterministic version planning, opt-in registry-specific publication commands, OCI tag checks, and explicit delayed monitoring are available. Live credentials, provider-side trusted publishing, registry acceptance, image builds, and deployment behavior remain external proof gates.
+Python `pyproject.toml` and Rust `Cargo.toml` package/workspace discovery, repository-only generic version targets, deterministic version planning, opt-in registry-specific publication commands, OCI tag checks, and explicit delayed monitoring are available. Live credentials, provider-side trusted publishing, registry acceptance, image builds, and deployment behavior remain external proof gates.
 
 See [docs/registries.md](docs/registries.md) for the built-in adapter contracts and fail-closed idempotency behavior.
 
@@ -219,7 +270,7 @@ pnpm verify
 
 The action bundle in `dist/` is generated with `pnpm bundle` and is committed because GitHub executes JavaScript actions from the repository contents.
 
-SemVerge does not use AI to create release communication. It uses explicit PR metadata, labels, and conventional commits with deterministic templates.
+SemVerge's release engine uses explicit PR metadata, labels, and conventional commits with deterministic templates. Optional AI assistance is isolated behind the explicit `assist` feature and can only suggest human-facing communication; it cannot change release decisions.
 
 ## Agent Quickstart
 

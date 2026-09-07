@@ -13,6 +13,64 @@ describe("configuration and version files", () => {
     expect(config.publishing.npm.idempotency).toBe("registry");
   });
 
+  it("keeps optional AI configuration disabled by default and validates enabled settings", () => {
+    expect(parseConfig("").ai).toEqual({ enabled: false, provider: "openai", model: "", timeoutMs: 10_000 });
+    const content = `ai:
+  enabled: true
+  provider: openai
+  model: test-model
+  timeoutMs: 2500
+`;
+    expect(parseConfig(content).ai).toEqual({ enabled: true, provider: "openai", model: "test-model", timeoutMs: 2500 });
+    expect(validateConfigContent(content)).toEqual([]);
+    expect(validateConfigContent("ai:\n  enabled: true\n  timeoutMs: 0\n")).toEqual(expect.arrayContaining([
+      { path: "ai.model", severity: "error", message: "must be a non-empty string when AI is enabled" },
+      { path: "ai.timeoutMs", severity: "error", message: "must be a positive integer" }
+    ]));
+  });
+
+  it("parses opt-in AI feature gates and bounded communication controls", () => {
+    const content = `ai:
+  enabled: true
+  provider: openai
+  model: test-model
+  releaseNotes: true
+  infer: true
+  tone: friendly
+  verbosity: concise
+`;
+    expect(parseConfig(content).ai).toEqual({
+      enabled: true,
+      provider: "openai",
+      model: "test-model",
+      timeoutMs: 10_000,
+      releaseNotes: true,
+      infer: true,
+      tone: "friendly",
+      verbosity: "concise"
+    });
+    expect(validateConfigContent(content)).toEqual([]);
+    expect(validateConfigContent("ai:\n  tone: salesy\n  verbosity: exhaustive\n")).toEqual(expect.arrayContaining([
+      { path: "ai.tone", severity: "error", message: "must be one of: neutral, friendly, professional" },
+      { path: "ai.verbosity", severity: "error", message: "must be one of: concise, standard, detailed" }
+    ]));
+  });
+
+  it("defaults customer quality to warnings and parses scoped allow terms", () => {
+    expect(parseConfig("").communication).toEqual({ customerQuality: { mode: "warn", allowTerms: [] } });
+    const content = `communication:
+  customerQuality:
+    mode: error
+    allowTerms: [API, registry]
+`;
+    expect(parseConfig(content).communication).toEqual({ customerQuality: { mode: "error", allowTerms: ["API", "registry"] } });
+    expect(validateConfigContent(content)).toEqual([]);
+    expect(validateConfigContent("communication:\n  customerQuality:\n    mode: block\n    allowTerms: not-an-array\n")).toEqual(expect.arrayContaining([
+      { path: "communication.customerQuality.mode", severity: "error", message: "must be one of: off, warn, error" },
+      { path: "communication.customerQuality.allowTerms", severity: "error", message: "must be an array of strings" }
+    ]));
+  });
+
   it("parses configurable channel labels and branch scoping", () => {
     const content = `release:\n  channels:\n    preview:\n      label: ship:preview\n      prerelease: preview\n    nightly:\n      label: ship:nightly\n      prerelease: nightly\n      branch: nightly\n`;
     const config = parseConfig(content);
